@@ -97,6 +97,7 @@ scp @sshCommon `
     "$root\talk_module\knowledge_store.py" `
     "$root\talk_module\explore_teaching.py" `
     "$root\talk_module\explore_teaching_api.py" `
+    "$root\talk_module\teaching_catalog.py" `
     "$root\talk_module\parla_teaching_config.py" `
     "$root\talk_module\visitor_context.py" `
     "$root\talk_module\arm_sdk.py" `

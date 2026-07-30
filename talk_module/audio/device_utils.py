@@ -408,7 +408,10 @@ def bluetooth_control_device(action: str, mac: str) -> tuple[bool, str]:
 
 def _find_pulse_portaudio_index() -> Optional[int]:
     """Find the 'pulse' or 'default' input device in PortAudio (for PulseAudio routing)."""
-    import sounddevice as sd
+    try:
+        import sounddevice as sd
+    except OSError:
+        return None
     for i, d in enumerate(sd.query_devices()):
         if d.get("max_input_channels", 0) > 0 and d.get("name", "").strip().lower() == "pulse":
             return i
@@ -479,7 +482,30 @@ def ensure_pulse_usb_microphone_source() -> Optional[str]:
         _run_text(["pactl", "set-default-source", source])
         _run_text(["pactl", "set-source-mute", source, "0"])
         _run_text(["pactl", "set-source-volume", source, "100%"])
-    return source
+        return source
+
+    # Nessuna sorgente USB/DJI esplicita: usa default Pulse (arecord -D pulse funziona comunque)
+    default_out, _ = _run_text(["pactl", "get-default-source"])
+    line = (default_out or "").strip()
+    if line:
+        fields = line.split()
+        if len(fields) >= 2:
+            name = fields[1].strip()
+            if name and "monitor" not in name.lower():
+                _run_text(["pactl", "set-source-mute", name, "0"])
+                return name
+    return "pulse"
+
+
+def portaudio_available() -> bool:
+    """True se libportaudio è caricabile (sounddevice può enumerare i device)."""
+    try:
+        import sounddevice as sd
+
+        sd.query_devices()
+        return True
+    except OSError:
+        return False
 
 
 def resolve_configured_microphone_index(mic_cfg: Optional[dict]) -> Optional[int]:
@@ -487,9 +513,14 @@ def resolve_configured_microphone_index(mic_cfg: Optional[dict]) -> Optional[int
     Indice PortAudio per il microfono salvato in config/audio_devices.json.
     Se device_id non è valido o non ha ingresso, cerca per nome o primo dispositivo USB.
     Su Linux usa PulseAudio per evitare lock esclusivi ALSA.
+    Se PortAudio non è disponibile, prepara PulseAudio/arecord e ritorna 0 (indice fittizio).
     """
     if not mic_cfg or mic_cfg.get("type") != "local":
         return None
+
+    if sys.platform == "linux" and not portaudio_available():
+        ensure_pulse_usb_microphone_source()
+        return 0
 
     # On Linux with PulseAudio: always prefer routing through PulseAudio
     # to avoid ALSA exclusive locks that block all other audio processes
@@ -505,7 +536,13 @@ def resolve_configured_microphone_index(mic_cfg: Optional[dict]) -> Optional[int
         want = int(raw) if raw is not None and str(raw).strip() != "" else None
     except (TypeError, ValueError):
         want = None
-    import sounddevice as sd
+    try:
+        import sounddevice as sd
+    except OSError:
+        if sys.platform == "linux":
+            ensure_pulse_usb_microphone_source()
+            return 0
+        return None
 
     if want is not None:
         try:
@@ -516,7 +553,13 @@ def resolve_configured_microphone_index(mic_cfg: Optional[dict]) -> Optional[int
             pass
     hint = (mic_cfg.get("name") or "").strip().lower()
     hint_compact = re.sub(r"\s*\([^)]*\)\s*$", "", hint).strip()
-    mics = list_microphones(physical_only=False)
+    try:
+        mics = list_microphones(physical_only=False)
+    except OSError:
+        if sys.platform == "linux":
+            ensure_pulse_usb_microphone_source()
+            return 0
+        return None
     for d in mics:
         if d.get("input_channels", 0) <= 0:
             continue
@@ -534,7 +577,13 @@ def resolve_configured_microphone_index(mic_cfg: Optional[dict]) -> Optional[int
     for d in mics:
         if d.get("device_type") == "usb" and d.get("input_channels", 0) > 0:
             return d.get("index")
-    return get_default_input_device()
+    fallback = get_default_input_device()
+    if fallback is not None:
+        return fallback
+    if sys.platform == "linux":
+        ensure_pulse_usb_microphone_source()
+        return 0
+    return None
 
 
 def get_default_input_device() -> Optional[int]:

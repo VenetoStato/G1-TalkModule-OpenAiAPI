@@ -10,10 +10,9 @@ from pydantic import BaseModel
 
 from talk_module.explore_teaching import (
     explore_teaching_status,
-    list_explore_teachings,
-    play_explore_teaching,
     stop_explore_teaching,
 )
+from talk_module.teaching_catalog import list_all_teachings, play_teaching
 
 router = APIRouter(prefix="/api/explore-teachings", tags=["explore-teachings"])
 
@@ -35,22 +34,27 @@ class ParlaGesturesBody(BaseModel):
 @router.get("")
 @router.get("/")
 def explore_teachings_list():
-    return list_explore_teachings()
+    return list_all_teachings()
 
 
 @router.get("/status")
 def explore_teachings_status():
     robot_ip = os.getenv("UNITREE_ROBOT_IP", "192.168.123.161")
-    return explore_teaching_status(robot_ip=robot_ip)
+    out = explore_teaching_status(robot_ip=robot_ip)
+    catalog = list_all_teachings(robot_ip=robot_ip)
+    out["teaching_count"] = catalog.get("teaching_count") or 0
+    out["explore_count"] = catalog.get("explore_count") or 0
+    out["local_count"] = catalog.get("local_count") or 0
+    return out
 
 
 @router.post("/play")
 def explore_teachings_play(body: PlayBody):
-    name = (body.name or body.action_name or "").strip()
-    if not name:
+    ref = (body.name or body.action_name or "").strip()
+    if not ref:
         return JSONResponse({"ok": False, "message": "name richiesto"}, status_code=400)
     robot_ip = body.robot_ip or os.getenv("UNITREE_ROBOT_IP", "192.168.123.161")
-    result = play_explore_teaching(name, robot_ip=robot_ip)
+    result = play_teaching(ref, robot_ip=robot_ip)
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
 

@@ -178,9 +178,15 @@ const Soundboard = (() => {
   }
 
   async function _fireRobotActions(slot) {
-    if (slot.teaching_slot != null && slot.teaching_slot !== "") {
+    const teach = String(slot.teaching_slot || "").trim();
+    if (teach) {
       try {
-        await fetch(Api._base() + "/api/teaching/replay_slot/" + slot.teaching_slot, { method: "POST" });
+        const ref = /^\d+$/.test(teach) ? ("local::" + teach) : teach;
+        await fetch(Api._base() + "/api/explore-teachings/play", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: ref }),
+        });
       } catch {}
     }
     const arm = (slot.robot_arm || "").trim();

@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import queue
 import re
@@ -33,6 +34,12 @@ except ImportError:
 from talk_module.config import settings
 from talk_module.wake import WAKE_STT_PROMPT, find_wake_and_rest
 from talk_module.audio_robot_effect import apply_robot_effect_base64
+from talk_module.audio.mic_gain import (
+    apply_wav_gain,
+    clamp_mic_gain,
+    clamp_voice_threshold,
+    voice_threshold_to_silence_rms,
+)
 from talk_module.network_discovery import (
     register_web_client,
     unregister_web_client,
@@ -245,7 +252,10 @@ if HAS_FASTAPI:
 
     try:
         from talk_module.teaching_api import router as teaching_router
-        if os.getenv("G1_LOCAL_TEACHING", "0").strip().lower() in ("1", "true", "yes", "on"):
+
+        _local_teaching_default = "1" if sys.platform.startswith("linux") else "0"
+        _local_teaching = os.getenv("G1_LOCAL_TEACHING", _local_teaching_default).strip().lower()
+        if _local_teaching not in ("0", "false", "no", "off"):
             app.include_router(teaching_router)
         else:
             print("[web_app] local teaching API disabled (set G1_LOCAL_TEACHING=1 to enable REC/slot teaching)")
@@ -281,6 +291,26 @@ if HAS_FASTAPI:
     # Lazy init dei servizi (richiedono API key)
     _stt = _llm = _tts = _player = _recorder = None
 
+    def _create_audio_recorder(mic_id):
+        """Pulse/arecord su Jetson (come Grok), fallback PortAudio."""
+        from talk_module.audio.recorder_factory import create_microphone_recorder
+
+        return create_microphone_recorder(mic_id)
+
+    def _get_jetson_recorder():
+        """Recorder per PTT/listen: non dipende da _AUDIO_AVAILABLE."""
+        _, _, _, _, recorder = get_services()
+        if recorder is not None:
+            return recorder
+        cfg = load_device_config()
+        mic_cfg = cfg.get("microphone") or {}
+        mic_id = (
+            resolve_configured_microphone_index(mic_cfg)
+            if isinstance(mic_cfg, dict) and mic_cfg.get("type") == "local"
+            else None
+        )
+        return _create_audio_recorder(mic_id)
+
     def get_services():
         global _stt, _llm, _tts, _player, _recorder, _device_config_mtime, _config_dirty
         if _config_dirty:
@@ -311,8 +341,30 @@ if HAS_FASTAPI:
             _tts = TTSClient()
             _player = _recorder = None
             try:
-                from talk_module.audio import AudioRecorder, AudioPlayer, _AUDIO_AVAILABLE
-                if _AUDIO_AVAILABLE and AudioRecorder:
+                from talk_module.audio import AudioPlayer
+
+                cfg = load_device_config()
+                mic_cfg = cfg.get("microphone")
+                mic_id = resolve_configured_microphone_index(mic_cfg) if isinstance(mic_cfg, dict) else None
+                spk_cfg = cfg.get("speaker")
+                spk_id = spk_cfg.get("device_id") if isinstance(spk_cfg, dict) and spk_cfg.get("type") == "local" else None
+                try:
+                    spk_id = int(spk_id) if spk_id is not None and str(spk_id).strip() != "" else None
+                except (TypeError, ValueError):
+                    spk_id = None
+                _player = AudioPlayer(device_id=spk_id)
+                _recorder = _create_audio_recorder(mic_id)
+                if mic_id is not None and _recorder is not None:
+                    mic_name = mic_cfg.get("name") if isinstance(mic_cfg, dict) else None
+                    print(f"[Audio] Mic config name={mic_name!r} index={mic_id}", flush=True)
+            except Exception as exc:
+                print(f"[Audio] init player/recorder failed: {exc}", flush=True)
+        else:
+            # Dopo salvataggio config: _player/_recorder possono essere None — ricrea da file.
+            if _recorder is None or _player is None:
+                try:
+                    from talk_module.audio import AudioPlayer
+
                     cfg = load_device_config()
                     mic_cfg = cfg.get("microphone")
                     mic_id = resolve_configured_microphone_index(mic_cfg) if isinstance(mic_cfg, dict) else None
@@ -323,32 +375,9 @@ if HAS_FASTAPI:
                     except (TypeError, ValueError):
                         spk_id = None
                     _player = AudioPlayer(device_id=spk_id)
-                    _recorder = AudioRecorder(device_id=mic_id)
-                    if mic_id is not None:
-                        print(f"[Audio] Recorder: PortAudio input index={mic_id} (config name={mic_cfg.get('name') if mic_cfg else None})", flush=True)
-            except (OSError, ImportError, TypeError, AttributeError, NameError):
-                pass
-        else:
-            # Dopo salvataggio config: _player/_recorder possono essere None — ricrea da file.
-            if _recorder is None or _player is None:
-                try:
-                    from talk_module.audio import AudioRecorder, AudioPlayer, _AUDIO_AVAILABLE
-                    if _AUDIO_AVAILABLE and AudioRecorder:
-                        cfg = load_device_config()
-                        mic_cfg = cfg.get("microphone")
-                        mic_id = resolve_configured_microphone_index(mic_cfg) if isinstance(mic_cfg, dict) else None
-                        spk_cfg = cfg.get("speaker")
-                        spk_id = spk_cfg.get("device_id") if isinstance(spk_cfg, dict) and spk_cfg.get("type") == "local" else None
-                        try:
-                            spk_id = int(spk_id) if spk_id is not None and str(spk_id).strip() != "" else None
-                        except (TypeError, ValueError):
-                            spk_id = None
-                        _player = AudioPlayer(device_id=spk_id)
-                        _recorder = AudioRecorder(device_id=mic_id)
-                        if mic_id is not None:
-                            print(f"[Audio] Recorder: PortAudio input index={mic_id} (config name={mic_cfg.get('name') if mic_cfg else None})", flush=True)
-                except (OSError, ImportError, TypeError, AttributeError, NameError):
-                    pass
+                    _recorder = _create_audio_recorder(mic_id)
+                except Exception as exc:
+                    print(f"[Audio] refresh player/recorder failed: {exc}", flush=True)
         return _stt, _llm, _tts, _player, _recorder
 
     @app.get("/")
@@ -972,11 +1001,14 @@ self.addEventListener('activate', () => self.clients.claim());
         return max(0, min(v, max_ms))
 
     def _normalize_soundboard_gesture_fields(robot_arm: str, teaching_slot: str) -> tuple[str, str]:
-        """Client may send explore teachings as explore::name in robot_arm. One gesture type per slot."""
+        """Client may send explore::name or local::slot in robot_arm. One gesture type per slot."""
         arm = str(robot_arm or "").strip()
         teach = str(teaching_slot or "").strip()
         if arm.startswith("explore::"):
             teach = arm[9:].strip() or teach
+            arm = ""
+        elif arm.startswith("local::"):
+            teach = arm
             arm = ""
         if arm and teach:
             teach = ""
@@ -1562,28 +1594,30 @@ self.addEventListener('activate', () => self.clients.claim());
 
     @app.get("/api/robot-unitree-teachings")
     def api_robot_unitree_teachings():
-        """Compat: elenco teach Explore app sul robot."""
-        from talk_module.explore_teaching import list_explore_teachings
+        """Compat: elenco teach Explore + locali Jetson."""
+        from talk_module.teaching_catalog import list_all_teachings
 
-        data = list_explore_teachings()
+        data = list_all_teachings()
         return {
             "ok": data.get("ok", False),
             "custom": data.get("teachings") or [],
+            "explore": data.get("explore") or [],
+            "local": data.get("local") or [],
             "preset": data.get("presets") or [],
             "error": data.get("error") or "",
         }
 
     @app.post("/api/robot-unitree-teachings/play")
     def api_robot_unitree_teaching_play(data: dict = Body(...)):
-        """Compat: riproduce teach Explore per nome."""
-        from talk_module.explore_teaching import play_explore_teaching
+        """Compat: riproduce teach Explore o locale (local::N / numero slot)."""
+        from talk_module.teaching_catalog import play_teaching
 
-        name = str(data.get("name") or data.get("action_name") or "").strip()
+        ref = str(data.get("name") or data.get("action_name") or data.get("ref") or "").strip()
         robot_ip = data.get("robot_ip") or os.getenv("UNITREE_ROBOT_IP", "192.168.123.161")
-        if not name:
+        if not ref:
             raise HTTPException(400, "name richiesto")
-        result = play_explore_teaching(name, robot_ip=robot_ip)
-        return {"ok": result.get("ok"), "message": result.get("message"), "name": name}
+        result = play_teaching(ref, robot_ip=robot_ip)
+        return {"ok": result.get("ok"), "message": result.get("message"), "name": ref}
 
     @app.post("/api/robot-action")
     def api_execute_robot_action(data: dict = Body(...)):
@@ -1636,7 +1670,16 @@ self.addEventListener('activate', () => self.clients.claim());
     @app.post("/api/config")
     def api_save_config(data: dict = Body(...)):
         global _player, _recorder, _config_dirty
-        save_device_config(data)
+        prev = load_device_config()
+        merged = {**prev, **data}
+        if "microphone" in data:
+            merged["microphone"] = data["microphone"]
+        if "speaker" in data:
+            merged["speaker"] = data["speaker"]
+        tts_out = data.get("tts_output")
+        if tts_out in ("browser", "server"):
+            merged["tts_output"] = tts_out
+        save_device_config(merged)
         _config_dirty = True
         return {"ok": True}
 
@@ -2008,22 +2051,30 @@ self.addEventListener('activate', () => self.clients.claim());
 
         spk = cfg.get("speaker") or {}
         play_local = spk.get("type") == "local"
+        play_on = (ws.query_params.get("play_on") or "browser").strip().lower()
+        listen_gain = clamp_mic_gain(ws.query_params.get("gain") or "1")
+        listen_threshold = clamp_voice_threshold(ws.query_params.get("threshold") or "20")
+        listen_silence_threshold = voice_threshold_to_silence_rms(listen_threshold)
+        try:
+            out_device_id = ws.query_params.get("device_id")
+        except Exception:
+            out_device_id = None
 
         listen_queue = queue.Queue()
         listen_stop = threading.Event()
 
         def _record_loop():
             try:
-                _, _, _, _, recorder = get_services()
+                recorder = _get_jetson_recorder()
                 if not recorder:
-                    listen_queue.put({"error": "PortAudio non disponibile"})
+                    listen_queue.put({"error": "Microfono Jetson non disponibile (PulseAudio/arecord)"})
                     return
                 print(f"[Listen] Record loop started, device={recorder.device_id}, rate={recorder.sample_rate}", flush=True)
                 chunk_count = 0
                 for audio_bytes in recorder.record_until_silence(
                     silence_seconds=settings.stt_listen_silence_sec,
                     chunk_duration=0.5,
-                    silence_threshold=0.0035,
+                    silence_threshold=listen_silence_threshold,
                     max_duration=60.0,
                     stop_check=lambda: listen_stop.is_set(),
                 ):
@@ -2054,13 +2105,15 @@ self.addEventListener('activate', () => self.clients.claim());
                 if isinstance(item, dict) and "error" in item:
                     await ws.send_text(json.dumps({"type": "error", "data": item["error"]}))
                     break
+                if listen_gain != 1.0:
+                    item = apply_wav_gain(item, listen_gain)
                 result = await loop.run_in_executor(_executor, partial(_process_audio, item, False, "wav"))
                 await ws.send_text(json.dumps({"type": "response", "data": result}))
-                if result.get("audio_base64"):
+                if result.get("audio_base64") and play_on == "server":
                     import base64 as b64
 
                     ab = b64.b64decode(result["audio_base64"])
-                    spk_dev = spk.get("device_id") if play_local else None
+                    spk_dev = out_device_id if out_device_id is not None else (spk.get("device_id") if play_local else None)
                     dev_id = int(spk_dev) if spk_dev is not None and spk_dev != "" else None
                     await loop.run_in_executor(
                         _executor,
@@ -2097,6 +2150,7 @@ self.addEventListener('activate', () => self.clients.claim());
         ptt_stop = threading.Event()
         ptt_queue = queue.Queue()
         recording = False
+        ptt_input_gain = 1.0
 
         try:
             while True:
@@ -2110,13 +2164,14 @@ self.addEventListener('activate', () => self.clients.claim());
                     if recording:
                         continue
                     recording = True
+                    ptt_input_gain = clamp_mic_gain(data.get("gain", 1.0))
                     ptt_stop.clear()
 
                     def _do_record():
                         try:
-                            _, _, _, _, recorder = get_services()
+                            recorder = _get_jetson_recorder()
                             if not recorder:
-                                ptt_queue.put({"error": "PortAudio non disponibile"})
+                                ptt_queue.put({"error": "Microfono Jetson non disponibile (PulseAudio/arecord)"})
                                 return
                             audio = recorder.record_until_stop(lambda: ptt_stop.is_set(), chunk_duration=0.2, min_duration=0.3)
                             ptt_queue.put(audio)
@@ -2141,19 +2196,23 @@ self.addEventListener('activate', () => self.clients.claim());
                     if len(item) < 500:
                         await ws.send_text(json.dumps({"type": "response", "data": {"text": "", "response": "", "audio_base64": "", "message": "Registrazione troppo corta"}}))
                         continue
+                    if ptt_input_gain != 1.0:
+                        item = apply_wav_gain(item, ptt_input_gain)
                     result = await loop.run_in_executor(_executor, partial(_process_audio, item, True, "wav"))
                     await ws.send_text(json.dumps({"type": "response", "data": result}))
-                    if result.get("audio_base64") and spk.get("type") == "local":
+                    play_on = str(data.get("play_on") or "browser").strip().lower()
+                    out_device_id = data.get("device_id")
+                    if result.get("audio_base64") and play_on == "server":
                         import base64 as b64
 
                         ab = b64.b64decode(result["audio_base64"])
-                        spk_dev = spk.get("device_id")
+                        spk_dev = out_device_id if out_device_id is not None else spk.get("device_id")
                         dev_id = int(spk_dev) if spk_dev is not None and spk_dev != "" else None
                         await loop.run_in_executor(
                             _executor,
                             partial(_play_tts_on_server, ab, "mp3", dev_id),
                         )
-                    # type network: il browser (/local) riproduce audio_base64 (telefono -> cassa BT)
+                    # play_on=browser: il client riproduce audio_base64 (PC/telefono)
                     recording = False
         except WebSocketDisconnect:
             pass
@@ -2321,9 +2380,10 @@ self.addEventListener('activate', () => self.clients.claim());
             raise HTTPException(400, "Configura altoparlante locale o di rete dal setup")
 
         def _do_record():
-            _, _, _, player, recorder = get_services()
+            _, _, _, player, _ = get_services()
+            recorder = _get_jetson_recorder()
             if not recorder:
-                return {"text": "", "response": "", "message": "PortAudio non disponibile. Esegui: sudo bash scripts/install_audio_jetson.sh"}
+                return {"text": "", "response": "", "message": "Microfono Jetson non disponibile. Verifica USB mic e PulseAudio (come Grok Voice)."}
             audio = recorder.record_fixed_duration(min(max(duration, 2), 30))
             if not audio or len(audio) < 500:
                 return {"text": "", "response": "", "message": "Audio non registrato"}
@@ -3718,11 +3778,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       <div class="hint" id="clientPickStatus" style="margin-top:8px;font-size:11px;color:#71717a;">Auto-pick: —</div>
     </section>
     <section id="section-teaching" class="section">
-      <h2 style="font-size:1.2rem;margin:0 0 12px;">Teaching Explore</h2>
+      <h2 style="font-size:1.2rem;margin:0 0 12px;">Teaching (Explore + Jetson)</h2>
       <div class="explore-teach-steps">
-        <strong>1.</strong> Registra sul telefono: app <strong>Unitree Explore</strong> → Function → Demo → Teaching → Create → salva con un nome.<br>
-        <strong>2.</strong> Sul telecomando: <strong>L1+A</strong> (sport mode). Poi <strong>Prepara robot</strong> qui sotto.<br>
-        <strong>3.</strong> <strong>Aggiorna elenco</strong> e premi <strong>Play</strong> sul movimento.
+        <strong>Explore (telefono):</strong> app <strong>Unitree Explore</strong> → Function → Demo → Teaching → Create → salva con un nome. Poi <strong>L1+A</strong> sul telecomando e <strong>Prepara robot</strong>.<br>
+        <strong>Jetson (braccia):</strong> Robot → Robot Control → sezione <strong>Teaching (braccia)</strong> → REC / STOP / SAVE in uno slot. I file restano in <code>config/teachings/</code> sul Jetson.
       </div>
       <div class="explore-teach-bar">
         <button type="button" id="exploreTeachRefresh" onclick="window.g1LoadExploreTeachings && window.g1LoadExploreTeachings()">Aggiorna elenco</button>
@@ -3731,7 +3790,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div class="explore-teach-parla" style="margin:0 0 16px;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.02);">
         <h3 style="margin:0 0 6px;font-size:13px;color:#e4e4e7;">Gesti Parla (max 3)</h3>
-        <p class="hint" style="margin:0 0 10px;font-size:11px;color:#71717a;">Durante le risposte in Parla (Talk classico e Grok Voice), G1 richiama a caso uno di questi teaching Explore.</p>
+        <p class="hint" style="margin:0 0 10px;font-size:11px;color:#71717a;">Durante le risposte in Parla (Talk classico e Grok Voice), G1 richiama a caso uno di questi movimenti (Explore o registrati sul Jetson).</p>
         <div id="parlaTeachGesturesPickers" style="display:flex;flex-direction:column;gap:8px;"></div>
         <div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
           <button type="button" id="parlaTeachGesturesSave" style="padding:8px 14px;background:rgba(20,184,166,0.15);color:#14b8a6;border:1px solid rgba(20,184,166,0.35);border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;">Salva gesti Parla</button>
@@ -4183,6 +4242,38 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     const MIN_REC_MS = 1200;
     let ws = null, mediaRecorder = null, chunks = [], recTimeout = null, lastPlayOn = 'browser', lastSinkId = null;
     let serverTtsDeviceId = null;
+    const TTS_PLAY_DEST_LS = 'g1_tts_play_dest';
+    function getTtsPlayDest() {
+      var el = document.getElementById('ttsPlayDest');
+      if (el && (el.value === 'server' || el.value === 'browser')) return el.value;
+      try {
+        var v = localStorage.getItem(TTS_PLAY_DEST_LS);
+        if (v === 'server' || v === 'browser') return v;
+      } catch(_){}
+      return 'browser';
+    }
+    function setTtsPlayDest(v, persist) {
+      var val = (v === 'server') ? 'server' : 'browser';
+      var el = document.getElementById('ttsPlayDest');
+      if (el) el.value = val;
+      if (persist !== false) {
+        try { localStorage.setItem(TTS_PLAY_DEST_LS, val); } catch(_){}
+      }
+      var hint = document.getElementById('ttsServerHint');
+      if (hint) {
+        hint.style.display = 'block';
+        hint.textContent = (val === 'server')
+          ? 'Salvato: audio sulla cassa Jetson/robot.'
+          : 'Salvato: audio sul browser (PC/telefono).';
+        hint.style.color = val === 'server' ? '#a78bfa' : '#14b8a6';
+      }
+    }
+    function restoreTtsPlayDest() {
+      try {
+        var v = localStorage.getItem(TTS_PLAY_DEST_LS);
+        if (v === 'server' || v === 'browser') setTtsPlayDest(v, false);
+      } catch(_){}
+    }
     let _serverDevicesCache = { microphones: [], speakers: [], hardware_probe: null };
     function escapeHtmlDevices(s){
       return String(s||'').replace(/&/g,'&amp;').replace(/\u003c/g,'&lt;').replace(/"/g,'&quot;');
@@ -4277,6 +4368,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     let recStartTime = 0, recDurationInterval = null, levelInterval = null, analyserNode = null, audioCtx = null;
     let isRecording = false, pendingStop = false, currentStream = null;
+    let pttInputGainNode = null;
     let wakeStream = null, wakeRawStream = null, wakeListenPending = false;
     let wakeListenActive = false, wakeMimeType = '', wakeActiveMr = null, wakeDiscardCurrentSlice = false;
     let wsListenServer = null, wakeServerMode = false;
@@ -4404,6 +4496,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
           try { localStorage.setItem('g1_mic_monitor_gain', String(g)); } catch (_) {}
           if (gDisp) gDisp.textContent = g.toFixed(1);
           if (wakeInputGainNode) wakeInputGainNode.gain.value = g;
+          if (pttInputGainNode) pttInputGainNode.gain.value = g;
         });
       }
       updateParlaThresholdLine();
@@ -4599,7 +4692,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         fetch('/api/led', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ effect: led }) }).catch(function(){});
       }
       if (teach) {
-        fetch('/api/explore-teachings/play', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: teach }) }).catch(function(){});
+        fetch('/api/explore-teachings/play', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: sbNormalizeTeachingRef(teach) }) }).catch(function(){});
       }
       if (arm) {
         fetch('/api/robot-action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ action_id: arm, robot_ip: ip }) }).catch(function(){});
@@ -4979,6 +5072,35 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         }
       }, CMD_TIMEOUT_MS);
     }
+    /** High-pass + compressore + guadagno UI → stream processato (Talk classico + Grok browser). */
+    function createSpeechEnhancedPipeline(rawStream, analyserFftSize) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const src = ctx.createMediaStreamSource(rawStream);
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 100;
+      hp.Q.value = 0.707;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -28;
+      comp.knee.value = 20;
+      comp.ratio.value = 3.5;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.12;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = analyserFftSize || 512;
+      analyser.smoothingTimeConstant = 0.35;
+      const micGain = ctx.createGain();
+      micGain.gain.value = getParlaMonitorGain();
+      const dest = ctx.createMediaStreamDestination();
+      src.connect(hp);
+      hp.connect(comp);
+      comp.connect(micGain);
+      micGain.connect(analyser);
+      micGain.connect(dest);
+      ctx.resume && ctx.resume();
+      return { ctx: ctx, analyser: analyser, inputGainNode: micGain, stream: dest.stream };
+    }
     function stopWakeLevelMeter(){
       if (wakeLevelSampleInterval) { clearInterval(wakeLevelSampleInterval); wakeLevelSampleInterval = null; }
       if (wakeLevelCtx) { try { wakeLevelCtx.close(); } catch(_){} wakeLevelCtx = null; }
@@ -4991,33 +5113,11 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       stopWakeLevelMeter();
       if (!wakeRawStream) return;
       try {
-        const Ctx = window.AudioContext || window.webkitAudioContext;
-        wakeLevelCtx = new Ctx();
-        const src = wakeLevelCtx.createMediaStreamSource(wakeRawStream);
-        const hp = wakeLevelCtx.createBiquadFilter();
-        hp.type = 'highpass';
-        hp.frequency.value = 100;
-        hp.Q.value = 0.707;
-        const comp = wakeLevelCtx.createDynamicsCompressor();
-        comp.threshold.value = -28;
-        comp.knee.value = 20;
-        comp.ratio.value = 3.5;
-        comp.attack.value = 0.003;
-        comp.release.value = 0.12;
-        wakeAnalyser = wakeLevelCtx.createAnalyser();
-        wakeAnalyser.fftSize = 512;
-        wakeAnalyser.smoothingTimeConstant = 0.35;
-        const micGain = wakeLevelCtx.createGain();
-        micGain.gain.value = getParlaMonitorGain();
-        wakeInputGainNode = micGain;
-        const dest = wakeLevelCtx.createMediaStreamDestination();
-        src.connect(hp);
-        hp.connect(comp);
-        comp.connect(micGain);
-        micGain.connect(wakeAnalyser);
-        micGain.connect(dest);
-        wakeStream = dest.stream;
-        wakeLevelCtx.resume && wakeLevelCtx.resume();
+        const pipeline = createSpeechEnhancedPipeline(wakeRawStream, 512);
+        wakeLevelCtx = pipeline.ctx;
+        wakeAnalyser = pipeline.analyser;
+        wakeInputGainNode = pipeline.inputGainNode;
+        wakeStream = pipeline.stream;
       } catch(_) {
         wakeStream = wakeRawStream;
         try {
@@ -5043,13 +5143,21 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     let wakeResponseTimeout = null;
     function ttsDestFromUi() {
-      const ttsEl = document.getElementById('ttsPlayDest');
-      const wantServer = ttsEl && ttsEl.value === 'server';
-      if (wantServer) {
-        return {
-          playOn: 'server',
-          deviceId: (serverTtsDeviceId !== null && !isNaN(serverTtsDeviceId)) ? serverTtsDeviceId : null
-        };
+      const dest = getTtsPlayDest();
+      const spkEl = document.getElementById('speaker');
+      const spkVal = spkEl ? String(spkEl.value || '') : '';
+      if (dest === 'server') {
+        var devId = (serverTtsDeviceId !== null && !isNaN(serverTtsDeviceId)) ? serverTtsDeviceId : null;
+        if (spkVal.indexOf('local_') === 0) {
+          var id = parseInt(spkVal.split('_')[1], 10);
+          if (!isNaN(id)) devId = id;
+        }
+        return { playOn: 'server', deviceId: devId };
+      }
+      if (spkVal.indexOf('browser_') === 0 && spkVal !== 'browser_default') {
+        lastSinkId = spkVal.replace(/^browser_/, '');
+      } else {
+        lastSinkId = null;
       }
       return { playOn: 'browser', deviceId: null };
     }
@@ -5168,7 +5276,15 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     function startWakeServerListener(){
       wakeServerMode = true;
-      var wsListenUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/listen';
+      var td = ttsDestFromUi();
+      lastPlayOn = td.playOn;
+      var wsListenUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/listen?play_on=' + encodeURIComponent(td.playOn);
+      var listenGain = typeof getParlaMonitorGain === 'function' ? getParlaMonitorGain() : 1;
+      var listenThreshold = typeof getWakeVoiceThreshold === 'function' ? getWakeVoiceThreshold() : 20;
+      wsListenUrl += '&gain=' + encodeURIComponent(listenGain) + '&threshold=' + encodeURIComponent(listenThreshold);
+      if (td.playOn === 'server' && td.deviceId != null) {
+        wsListenUrl += '&device_id=' + encodeURIComponent(String(td.deviceId));
+      }
       wsListenServer = new WebSocket(wsListenUrl);
       var st = document.getElementById('wakeListenStatus');
       wsListenServer.onopen = function(){
@@ -5211,8 +5327,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
               var resEl = document.getElementById('result');
               if (resEl) resEl.innerHTML = '<div class="ok"><strong>Tu:</strong> ' + (d.text||'').replace(/</g,'&lt;') + '<br><strong>G1:</strong> ' + (d.response||'').replace(/</g,'&lt;') + '</div>';
               if (st) st.textContent = 'In ascolto per «Hey G1»…';
+              if (d.audio_base64 && String(d.audio_base64).length > 50 && getTtsPlayDest() === 'browser') {
+                enqueueTtsPlayback(d.audio_base64, null);
+              }
             }
-            /* Risposta TTS: solo sul robot (ws/listen), non sul browser. */
           }
         } catch(_){}
       };
@@ -5304,7 +5422,8 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
             let s = 0;
             for (let i = 0; i < buf.length; i++) if (buf[i] > s) s = buf[i];
             if (s > wakeSlicePeak) wakeSlicePeak = s;
-            if (typeof window.g1UpdateTalkMicLevel === 'function') window.g1UpdateTalkMicLevel(s);
+            var sliceGain = typeof getParlaMonitorGain === 'function' ? getParlaMonitorGain() : 1;
+            if (typeof window.g1UpdateTalkMicLevel === 'function') window.g1UpdateTalkMicLevel(Math.min(255, s * sliceGain));
             const th = getWakeVoiceThreshold();
             if (s >= th) { voiceDurationMs += 50; lastVoiceTs = Date.now(); }
             if (isCmd && voiceDurationMs >= CMD_MIN_VOICE_MS && lastVoiceTs > 0 && (Date.now() - lastVoiceTs >= CMD_SILENCE_MS)) {
@@ -5545,16 +5664,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       wakeListenPending = false;
       stopWakeRecorder();
       const spkVal = document.getElementById('speaker') ? document.getElementById('speaker').value : '';
-      const ttsEl = document.getElementById('ttsPlayDest');
-      const wantServerTts = ttsEl && ttsEl.value === 'server';
-      if (wantServerTts) {
-        lastPlayOn = 'server';
-        lastSinkId = null;
-      } else {
-        lastPlayOn = 'browser';
-        lastSinkId = (spkVal && spkVal.startsWith('browser_') && spkVal !== 'browser_default') ? spkVal.replace('browser_','') : null;
-        syncSbOutputFromSpeaker();
-      }
+      const td = ttsDestFromUi();
+      lastPlayOn = td.playOn;
+      lastSinkId = (spkVal && spkVal.startsWith('browser_') && spkVal !== 'browser_default') ? spkVal.replace('browser_','') : null;
+      if (td.playOn === 'browser') syncSbOutputFromSpeaker();
       try {
         await ensureParlaWs();
       } catch(e) {
@@ -5582,7 +5695,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       }, 150);
       recTimeout = setTimeout(function(){ stopRec(); }, MAX_REC_SEC * 1000);
       try {
-        wsParla.send(JSON.stringify({type:'start'}));
+        wsParla.send(JSON.stringify({
+          type: 'start',
+          gain: typeof getParlaMonitorGain === 'function' ? getParlaMonitorGain() : 1
+        }));
       } catch(err) {
         recordingServerJetson = false;
         isRecording = false;
@@ -5593,23 +5709,14 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     /* connect() dopo init UI — vedi fine script */
     (function loadServerTtsConfig(){
+      restoreTtsPlayDest();
       fetch('/api/config').then(function(r){ return r.json(); }).then(function(cfg){
-        var mic = cfg && cfg.microphone;
-        var micIsBrowser = mic && mic.type === 'network' && mic.value && mic.value !== 'web_wait';
         var sp = cfg && cfg.speaker;
-        var hasLocalSpk = sp && sp.type === 'local' && (sp.device_id !== undefined && sp.device_id !== null && sp.device_id !== '');
-        var tts = document.getElementById('ttsPlayDest');
-        if (micIsBrowser && tts) {
-          tts.value = 'browser';
-        } else if (hasLocalSpk) {
+        if (cfg && (cfg.tts_output === 'server' || cfg.tts_output === 'browser')) {
+          setTtsPlayDest(cfg.tts_output, true);
+        }
+        if (sp && sp.type === 'local' && sp.device_id !== undefined && sp.device_id !== null && sp.device_id !== '') {
           serverTtsDeviceId = parseInt(sp.device_id, 10);
-          if (tts && !isNaN(serverTtsDeviceId)) tts.value = 'server';
-          var sb = document.getElementById('sbPlayDest');
-          if (sb && !isNaN(serverTtsDeviceId)) sb.value = 'server';
-        } else {
-          var sb0 = document.getElementById('sbPlayDest');
-          if (sb0) { sb0.value = 'browser'; }
-          if (tts) tts.value = 'browser';
         }
         var wrap = document.getElementById('ttsOutputWrap');
         if (wrap) wrap.style.display = 'block';
@@ -5752,6 +5859,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       spkSel.onchange = function(){
         const v = spkSel.value;
         lastSinkId = (v && v.indexOf('browser_') === 0 && v !== 'browser_default') ? v.replace(/^browser_/, '') : null;
+        var tts = document.getElementById('ttsPlayDest');
+        if (v === 'browser_default' || v.indexOf('browser_') === 0) {
+          setTtsPlayDest('browser', true);
+        }
         syncSbOutputFromSpeaker();
         updateActiveMicIndicator();
         autoSaveMicConfigFromUi();
@@ -5776,7 +5887,11 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       var micSel = document.getElementById('mic');
       var spkSel = document.getElementById('speaker');
       if (!micSel || !spkSel || !micSel.value) return;
-      var body = { microphone: buildMicCfgFromSelect(micSel.value), speaker: buildSpkCfgFromSelect(spkSel.value) };
+      var body = {
+        microphone: buildMicCfgFromSelect(micSel.value),
+        speaker: buildSpkCfgFromSelect(spkSel.value),
+        tts_output: getTtsPlayDest()
+      };
       fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(function(){});
     }
 
@@ -5899,20 +6014,21 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         const st = document.getElementById('devicesSaveStatus');
         const micVal = document.getElementById('mic').value;
         const spkVal = document.getElementById('speaker').value;
-        const body = { microphone: buildMicCfgFromSelect(micVal), speaker: buildSpkCfgFromSelect(spkVal) };
+        const body = {
+          microphone: buildMicCfgFromSelect(micVal),
+          speaker: buildSpkCfgFromSelect(spkVal),
+          tts_output: getTtsPlayDest()
+        };
         if (st) st.textContent = 'Salvataggio…';
         fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           .then(function(r){ if (!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
           .then(function(){
             if (st) st.textContent = 'Salvato.';
+            setTtsPlayDest(getTtsPlayDest(), true);
             fetch('/api/config').then(function(r){ return r.json(); }).then(function(cfg){
               var sp = cfg && cfg.speaker;
               if (sp && sp.type === 'local' && sp.device_id != null && sp.device_id !== '') {
                 serverTtsDeviceId = parseInt(sp.device_id, 10);
-                var tts = document.getElementById('ttsPlayDest');
-                if (tts) tts.value = 'server';
-                var sb = document.getElementById('sbPlayDest');
-                if (sb) sb.value = 'server';
               }
               if (typeof updateSbBrowserRowVisibility === 'function') updateSbBrowserRowVisibility();
             }).catch(function(){});
@@ -5925,6 +6041,13 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       var lb = document.getElementById('ttsGainLabel');
       var sl2 = document.getElementById('parlaGainSlider');
       var lb2 = document.getElementById('parlaGainLabel');
+      var ttsDest = document.getElementById('ttsPlayDest');
+      if (ttsDest) {
+        ttsDest.addEventListener('change', function(){
+          setTtsPlayDest(ttsDest.value, true);
+          autoSaveMicConfigFromUi();
+        });
+      }
       function syncAll(v){
         setTtsGain(v);
         if (sl) { sl.value = v; }
@@ -6189,39 +6312,63 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     const SB_AUDIO_COUNT = 50;
     const SB_ROBOT_START = 50;
     const SB_EXPLORE_GESTURE_PREFIX = 'explore::';
+    const SB_LOCAL_GESTURE_PREFIX = 'local::';
     var _sbArmGestureRefreshGen = 0;
     var _sbArmGestureRefreshPromise = null;
-    function sbRemoveExploreGestureGroups(sel){
+    function sbNormalizeTeachingRef(teach){
+      teach = String(teach || '').trim();
+      if (!teach) return '';
+      if (teach.indexOf(SB_LOCAL_GESTURE_PREFIX) === 0 || teach.indexOf(SB_EXPLORE_GESTURE_PREFIX) === 0) return teach;
+      if (/^\d+$/.test(teach)) return SB_LOCAL_GESTURE_PREFIX + teach;
+      return SB_EXPLORE_GESTURE_PREFIX + teach;
+    }
+    function sbRemoveTeachingGestureGroups(sel){
       if (!sel) return;
       sel.querySelectorAll('optgroup').forEach(function(og){
-        if (og.id === 'sbExploreGesturesGroup' || og.label === 'Addestrati (Explore)') og.remove();
+        if (og.id === 'sbExploreGesturesGroup' || og.id === 'sbLocalGesturesGroup'
+          || og.label === 'Addestrati (Explore)' || og.label === 'Registrati Jetson (braccia)') og.remove();
       });
+    }
+    function sbRemoveExploreGestureGroups(sel){ sbRemoveTeachingGestureGroups(sel); }
+    function sbAppendTeachingGestureGroups(sel, items){
+      if (!sel || !items || !items.length) return;
+      var explore = items.filter(function(t){ return (t.source || '') !== 'local_arm'; });
+      var local = items.filter(function(t){ return (t.source || '') === 'local_arm'; });
+      function addGroup(id, label, rows, valueFn, textFn){
+        if (!rows.length) return;
+        var og = document.createElement('optgroup');
+        og.id = id;
+        og.label = label;
+        rows.forEach(function(t){
+          var val = valueFn(t);
+          if (!val) return;
+          var opt = document.createElement('option');
+          opt.value = val;
+          opt.textContent = textFn(t);
+          og.appendChild(opt);
+        });
+        sel.appendChild(og);
+      }
+      addGroup('sbExploreGesturesGroup', 'Addestrati (Explore)', explore,
+        function(t){ return t.ref || (SB_EXPLORE_GESTURE_PREFIX + String(t.name || '').trim()); },
+        function(t){ return String(t.display_name || t.name || '').trim(); });
+      addGroup('sbLocalGesturesGroup', 'Registrati Jetson (braccia)', local,
+        function(t){ return t.ref || (SB_LOCAL_GESTURE_PREFIX + String(t.slot_id != null ? t.slot_id : '')); },
+        function(t){ return String(t.display_name || t.name || '').trim(); });
     }
     function sbRefreshArmGestureOptions(){
       var sel = document.getElementById('sbModalArm');
       if (!sel) return Promise.resolve();
       if (_sbArmGestureRefreshPromise) return _sbArmGestureRefreshPromise;
-      sbRemoveExploreGestureGroups(sel);
+      sbRemoveTeachingGestureGroups(sel);
       var gen = ++_sbArmGestureRefreshGen;
       _sbArmGestureRefreshPromise = fetch('/api/explore-teachings')
         .then(function(r){ return r.json(); })
         .then(function(d){
           if (gen !== _sbArmGestureRefreshGen) return;
-          sbRemoveExploreGestureGroups(sel);
+          sbRemoveTeachingGestureGroups(sel);
           var items = (d && d.ok && d.teachings) ? d.teachings : [];
-          if (!items.length) return;
-          var og = document.createElement('optgroup');
-          og.id = 'sbExploreGesturesGroup';
-          og.label = 'Addestrati (Explore)';
-          items.forEach(function(t){
-            var nm = String(t.name || '').trim();
-            if (!nm) return;
-            var opt = document.createElement('option');
-            opt.value = SB_EXPLORE_GESTURE_PREFIX + nm;
-            opt.textContent = nm;
-            og.appendChild(opt);
-          });
-          sel.appendChild(og);
+          sbAppendTeachingGestureGroups(sel, items);
         })
         .catch(function(){})
         .finally(function(){
@@ -6231,8 +6378,8 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     function sbGetModalGesture(){
       var v = (document.getElementById('sbModalArm')||{}).value || '';
-      if (v.indexOf(SB_EXPLORE_GESTURE_PREFIX) === 0) {
-        return { robot_arm: '', teaching_slot: v.slice(SB_EXPLORE_GESTURE_PREFIX.length) };
+      if (v.indexOf(SB_EXPLORE_GESTURE_PREFIX) === 0 || v.indexOf(SB_LOCAL_GESTURE_PREFIX) === 0) {
+        return { robot_arm: '', teaching_slot: v };
       }
       return { robot_arm: v, teaching_slot: '' };
     }
@@ -6253,20 +6400,18 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       if (!sel) return;
       var teach = (s && s.teaching_slot != null) ? String(s.teaching_slot).trim() : '';
       var arm = (s && s.robot_arm != null) ? String(s.robot_arm).trim() : '';
-      var want = teach ? (SB_EXPLORE_GESTURE_PREFIX + teach) : (arm || '');
+      var want = '';
+      if (teach) want = sbNormalizeTeachingRef(teach);
+      else if (arm) want = arm;
       var hasOpt = Array.prototype.some.call(sel.options, function(o){ return o.value === want; });
       if (want && !hasOpt && teach) {
-        var og = sel.querySelector('#sbExploreGesturesGroup') || sel.querySelector('optgroup[label="Addestrati (Explore)"]');
-        if (!og) {
-          og = document.createElement('optgroup');
-          og.id = 'sbExploreGesturesGroup';
-          og.label = 'Addestrati (Explore)';
-          sel.appendChild(og);
-        }
-        var opt = document.createElement('option');
-        opt.value = want;
-        opt.textContent = teach;
-        og.appendChild(opt);
+        sbAppendTeachingGestureGroups(sel, [{
+          source: want.indexOf(SB_LOCAL_GESTURE_PREFIX) === 0 ? 'local_arm' : 'explore_app',
+          ref: want,
+          name: teach,
+          display_name: teach,
+          slot_id: want.indexOf(SB_LOCAL_GESTURE_PREFIX) === 0 ? parseInt(want.slice(SB_LOCAL_GESTURE_PREFIX.length), 10) : null
+        }]);
       }
       sel.value = want;
     }
@@ -6403,12 +6548,13 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         return false;
       };
     })();
-    window.g1PlayExploreTeaching = function(name){
-      if (!name) return;
+    window.g1PlayExploreTeaching = function(ref){
+      ref = sbNormalizeTeachingRef(ref);
+      if (!ref) return;
       fetch('/api/explore-teachings/play', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name })
+        body: JSON.stringify({ name: ref })
       }).then(function(r){ return r.json(); }).then(function(d){
         if (!d.ok) alert('Teaching: ' + (d.message || 'errore'));
         if (typeof window.g1RefreshExploreTeachFsm === 'function') window.g1RefreshExploreTeachFsm();
@@ -6432,8 +6578,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         var label = sport.sport_label || sport.sport_status || '—';
         var detail = sport.detail || '';
         var arm = d.arm_sdk_active ? ' · arm_sdk OCCUPATO (ferma VR/REC)' : '';
-        var count = (d.teaching_count != null) ? (' · ' + d.teaching_count + ' teach') : '';
-        el.textContent = 'Stato robot: ' + label + count + arm + (detail ? (' — ' + detail) : '');
+        var count = (d.teaching_count != null) ? (' · ' + d.teaching_count + ' movimenti') : '';
+        var localCount = (d.local_count != null && d.local_count > 0) ? (' · ' + d.local_count + ' Jetson') : '';
+        var exploreCount = (d.explore_count != null && d.explore_count > 0) ? (' · ' + d.explore_count + ' Explore') : '';
+        el.textContent = 'Stato robot: ' + label + count + localCount + exploreCount + arm + (detail ? (' — ' + detail) : '');
         el.style.color = d.arm_sdk_active ? '#f87171' : '#71717a';
       }).catch(function(){ el.textContent = 'Stato robot: non disponibile'; });
     };
@@ -6443,35 +6591,44 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         .then(function(d){ if (!d.ok) alert('Stop: ' + (d.message || 'errore')); })
         .catch(function(e){ alert('Stop: ' + (e.message || String(e))); });
     };
-    window.g1PopulateExploreTeachingSelect = function(selectEl, selectedName){
+    window.g1PopulateExploreTeachingSelect = function(selectEl, selectedRef){
       if (!selectEl) return Promise.resolve();
       return fetch('/api/explore-teachings')
         .then(function(r){ return r.json(); })
         .then(function(d){
           var items = (d && d.ok && d.teachings) ? d.teachings : ((d && d.custom) ? d.custom : []);
-          var html = '<option value="">— Movimento Explore —</option>';
+          var html = '<option value="">— Movimento —</option>';
           items.forEach(function(t){
-            var nm = String(t.name || '');
-            var esc = nm.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-            html += '<option value="' + esc + '">' + esc + '</option>';
+            var ref = String(t.ref || '').trim();
+            if (!ref && t.source === 'local_arm' && t.slot_id != null) ref = SB_LOCAL_GESTURE_PREFIX + t.slot_id;
+            if (!ref) ref = SB_EXPLORE_GESTURE_PREFIX + String(t.name || '').trim();
+            var label = String(t.display_name || t.name || ref).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+            var escRef = ref.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+            var tag = (t.source === 'local_arm') ? ' [Jetson]' : ' [Explore]';
+            html += '<option value="' + escRef + '">' + label + tag + '</option>';
           });
           selectEl.innerHTML = html;
-          if (selectedName) selectEl.value = selectedName;
+          if (selectedRef) selectEl.value = sbNormalizeTeachingRef(selectedRef);
         })
         .catch(function(){});
     };
-    window._parlaTeachingNamesCache = [];
-    window.g1PopulateParlaTeachingPickers = function(selectedGestures, teachingNames){
+    window._parlaTeachingRefsCache = [];
+    window.g1PopulateParlaTeachingPickers = function(selectedGestures, teachingItems){
       var wrap = document.getElementById('parlaTeachGesturesPickers');
       if (!wrap) return;
-      var names = teachingNames || window._parlaTeachingNamesCache || [];
+      var items = teachingItems || window._parlaTeachingRefsCache || [];
       var picked = Array.isArray(selectedGestures) ? selectedGestures : [];
       wrap.innerHTML = [0, 1, 2].map(function(i){
-        var val = String(picked[i] || '').trim();
-        var opts = '<option value="">— nessuno —</option>' + names.map(function(nm){
-          var esc = String(nm || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-          var sel = (val && nm === val) ? ' selected' : '';
-          return '<option value="' + esc + '"' + sel + '>' + esc + '</option>';
+        var val = sbNormalizeTeachingRef(String(picked[i] || '').trim());
+        var opts = '<option value="">— nessuno —</option>' + items.map(function(t){
+          var ref = String(t.ref || '').trim();
+          if (!ref && t.source === 'local_arm' && t.slot_id != null) ref = SB_LOCAL_GESTURE_PREFIX + t.slot_id;
+          if (!ref) ref = SB_EXPLORE_GESTURE_PREFIX + String(t.name || '').trim();
+          var label = String(t.display_name || t.name || ref);
+          var escRef = ref.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+          var escLabel = label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+          var sel = (val && ref === val) ? ' selected' : '';
+          return '<option value="' + escRef + '"' + sel + '>' + escLabel + '</option>';
         }).join('');
         return '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#d4d4d8;">'
           + '<span style="min-width:58px;color:#71717a;">Gesto ' + (i + 1) + '</span>'
@@ -6483,7 +6640,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       return fetch('/api/explore-teachings/parla-gestures')
         .then(function(r){ return r.json(); })
         .then(function(d){
-          window.g1PopulateParlaTeachingPickers(d.gestures || [], window._parlaTeachingNamesCache || []);
+          window.g1PopulateParlaTeachingPickers(d.gestures || [], window._parlaTeachingRefsCache || []);
           return d;
         })
         .catch(function(){ return null; });
@@ -6504,7 +6661,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         body: JSON.stringify({ gestures: gestures })
       }).then(function(r){ return r.json(); }).then(function(d){
         if (status) status.textContent = d.ok ? 'Salvato' : (d.message || 'Errore');
-        if (d.ok) window.g1PopulateParlaTeachingPickers(d.gestures || [], window._parlaTeachingNamesCache || []);
+        if (d.ok) window.g1PopulateParlaTeachingPickers(d.gestures || [], window._parlaTeachingRefsCache || []);
         setTimeout(function(){ if (status) status.textContent = ''; }, 2500);
         return d;
       }).catch(function(e){
@@ -6530,11 +6687,11 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         if (!list || list._explorePlayBound) return;
         list._explorePlayBound = true;
         list.addEventListener('click', function(ev){
-          var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-explore-play]') : null;
+          var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-teaching-play], button[data-explore-play]') : null;
           if (!btn || !list.contains(btn)) return;
           ev.preventDefault();
-          var teachName = btn.getAttribute('data-explore-play') || '';
-          if (typeof window.g1PlayExploreTeaching === 'function') window.g1PlayExploreTeaching(teachName);
+          var teachRef = btn.getAttribute('data-teaching-play') || btn.getAttribute('data-explore-play') || '';
+          if (typeof window.g1PlayExploreTeaching === 'function') window.g1PlayExploreTeaching(teachRef);
         });
       }
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindExploreTeachListClicks);
@@ -6556,20 +6713,26 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
             return;
           }
           var items = d.teachings || [];
-          window._parlaTeachingNamesCache = items.map(function(t){ return String(t.name || '').trim(); }).filter(Boolean);
+          window._parlaTeachingRefsCache = items;
           window.g1PopulateExploreTeachingSelect(document.getElementById('sbModalExploreTeaching'));
           if (typeof window.g1LoadParlaTeachingGestures === 'function') window.g1LoadParlaTeachingGestures();
           if (!items.length) {
-            list.innerHTML = '<p class="hint" style="margin:0;font-size:12px;color:#52525b;">Nessun movimento nell&#39;app Explore sul robot. Registra prima dal telefono, poi Aggiorna.</p>';
+            list.innerHTML = '<p class="hint" style="margin:0;font-size:12px;color:#52525b;">Nessun movimento. Registra con Explore sul telefono oppure REC in Robot Control, poi Aggiorna.</p>';
             return;
           }
           list.innerHTML = items.map(function(t){
             var dur = (t.duration_s != null) ? (t.duration_s + 's') : '—';
-            var nm = String(t.name || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-            var attrName = String(t.name || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/'/g,'&#39;');
-            return '<div class="explore-teach-item"><span class="et-name">' + nm + '</span>'
-              + '<span class="et-dur">' + dur + '</span>'
-              + '<button type="button" data-explore-play="' + attrName + '">Play</button></div>';
+            var label = String(t.display_name || t.name || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+            var ref = String(t.ref || '').trim();
+            if (!ref && t.source === 'local_arm' && t.slot_id != null) ref = SB_LOCAL_GESTURE_PREFIX + t.slot_id;
+            if (!ref) ref = SB_EXPLORE_GESTURE_PREFIX + String(t.name || '').trim();
+            var attrRef = ref.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/'/g,'&#39;');
+            var src = (t.source === 'local_arm')
+              ? '<span class="et-dur" style="color:#5eead4;">Jetson</span>'
+              : '<span class="et-dur">Explore</span>';
+            return '<div class="explore-teach-item"><span class="et-name">' + label + '</span>'
+              + src + '<span class="et-dur">' + dur + '</span>'
+              + '<button type="button" data-teaching-play="' + attrRef + '">Play</button></div>';
           }).join('');
         })
         .catch(function(e){
@@ -6881,26 +7044,42 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       isRecording = true;
       pendingStop = false;
       const spkVal = document.getElementById('speaker').value;
-      const ttsEl = document.getElementById('ttsPlayDest');
-      const wantServerTts = ttsEl && ttsEl.value === 'server';
-      if (wantServerTts) {
-        lastPlayOn = 'server';
-        lastSinkId = null;
-      } else {
-        lastPlayOn = 'browser';
+      const td = ttsDestFromUi();
+      lastPlayOn = td.playOn;
+      if (td.playOn === 'browser') {
         lastSinkId = (spkVal && spkVal.startsWith('browser_') && spkVal !== 'browser_default') ? spkVal.replace('browser_','') : null;
         syncSbOutputFromSpeaker();
+      } else {
+        lastSinkId = null;
       }
-      const deviceId = wantServerTts ? serverTtsDeviceId : null;
+      const deviceId = td.deviceId;
       try {
         stopParlaMicPreview();
-        const stream = await navigator.mediaDevices.getUserMedia(buildAudioCaptureConstraints(micForBrowserCapture()));
-        if(pendingStop){ stream.getTracks().forEach(t=>t.stop()); isRecording=false; return; }
-        currentStream = stream;
+        const rawStream = (typeof getUserMediaWithFallback === 'function')
+          ? await getUserMediaWithFallback(micForBrowserCapture())
+          : await navigator.mediaDevices.getUserMedia(buildAudioCaptureConstraints(micForBrowserCapture()));
+        if(pendingStop){ rawStream.getTracks().forEach(t=>t.stop()); isRecording=false; return; }
+        currentStream = rawStream;
+        let recordStream = rawStream;
+        pttInputGainNode = null;
+        try {
+          const pipeline = createSpeechEnhancedPipeline(rawStream, 256);
+          audioCtx = pipeline.ctx;
+          analyserNode = pipeline.analyser;
+          pttInputGainNode = pipeline.inputGainNode;
+          recordStream = pipeline.stream;
+        } catch(_) {
+          audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+          const src = audioCtx.createMediaStreamSource(rawStream);
+          analyserNode = audioCtx.createAnalyser();
+          analyserNode.fftSize = 256;
+          analyserNode.smoothingTimeConstant = 0.5;
+          src.connect(analyserNode);
+        }
         await new Promise(r => setTimeout(r, 150));
-        if(pendingStop){ stream.getTracks().forEach(t=>t.stop()); isRecording=false; return; }
+        if(pendingStop){ rawStream.getTracks().forEach(t=>t.stop()); isRecording=false; pttInputGainNode=null; return; }
         const mimeType = preferredRecorderMime();
-        mediaRecorder = new MediaRecorder(stream, { mimeType: mimeType, audioBitsPerSecond: 128000 });
+        mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType, audioBitsPerSecond: 128000 });
         chunks = [];
         mediaRecorder.ondataavailable = e => { if(e.data && e.data.size > 0) chunks.push(e.data); };
         mediaRecorder.onstop = () => {
@@ -6910,6 +7089,9 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
           if (btn) btn.classList.remove('recording');
           isRecording = false;
           if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream=null; }
+          pttInputGainNode = null;
+          if (audioCtx) { try { audioCtx.close(); } catch(_){} audioCtx = null; }
+          analyserNode = null;
           const dur = Date.now() - recStartTime;
           if(dur < MIN_REC_MS){
             document.getElementById('recDebug').textContent = 'Troppo breve ('+Math.round(dur/100)+' decimi sec). Tieni premuto 1-2 secondi.';
@@ -6937,22 +7119,16 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('recDebug').style.color = '#22c55e';
         }, 200);
         try {
-          audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-          const src = audioCtx.createMediaStreamSource(stream);
-          analyserNode = audioCtx.createAnalyser();
-          analyserNode.fftSize = 256;
-          analyserNode.smoothingTimeConstant = 0.5;
-          src.connect(analyserNode);
           const data = new Uint8Array(analyserNode.frequencyBinCount);
           levelInterval = setInterval(() => {
             if(!analyserNode) return;
             analyserNode.getByteFrequencyData(data);
-            let sum = 0;
-            for(let i=0;i<data.length;i++) sum += data[i];
-            const avg = sum / data.length;
-            const pct = Math.min(100, Math.round(avg * 2));
+            let peak = 0;
+            for(let i=0;i<data.length;i++) if (data[i] > peak) peak = data[i];
+            const gain = typeof getParlaMonitorGain === 'function' ? getParlaMonitorGain() : 1;
+            const pct = Math.min(100, Math.round(peak * gain * (100 / 255)));
             document.getElementById('levelBar').style.width = pct+'%';
-            document.getElementById('levelLabel').textContent = pct > 5 ? 'Ti sento! ('+pct+'%)' : 'Livello: '+pct+'%';
+            document.getElementById('levelLabel').textContent = peak > 5 ? 'Ti sento! ('+pct+'%)' : 'Livello: '+pct+'%';
           }, 80);
         } catch(_){}
         if (btn) btn.classList.add('recording');
@@ -6972,6 +7148,9 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       if(recTimeout){ clearTimeout(recTimeout); recTimeout = null; }
       if(recDurationInterval){ clearInterval(recDurationInterval); recDurationInterval = null; }
       if(levelInterval){ clearInterval(levelInterval); levelInterval = null; }
+      pttInputGainNode = null;
+      if (audioCtx) { try { audioCtx.close(); } catch(_){} audioCtx = null; }
+      analyserNode = null;
     }
     function stopRec(){
       if(!isRecording) return;
@@ -6982,7 +7161,15 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         recordingServerJetson = false;
         isRecording = false;
         if (wsParla && wsParla.readyState === WebSocket.OPEN) {
-          try { wsParla.send(JSON.stringify({type:'stop'})); } catch(_){}
+          try {
+            const td = ttsDestFromUi();
+            lastPlayOn = td.playOn;
+            wsParla.send(JSON.stringify({
+              type: 'stop',
+              play_on: td.playOn,
+              device_id: td.deviceId
+            }));
+          } catch(_){}
         }
         document.getElementById('recDebug').textContent = 'Elaborazione (audio dal robot)…';
         document.getElementById('recDebug').style.color = '#3b82f6';
@@ -8251,8 +8438,19 @@ background-size:24px 24px,24px 24px,100% 100%;}
   window.teachAction = function(action) {
     log('Teaching: ' + action);
     fetch('/api/teaching/' + action, { method: 'POST' })
-      .then(function(r){ return r.json(); })
-      .then(function(d){
+      .then(function(r){
+        return r.json().then(function(d){ return { httpOk: r.ok, status: r.status, body: d }; });
+      })
+      .then(function(res){
+        var d = res.body || {};
+        if (!res.httpOk) {
+          if (res.status === 404) {
+            log('Teaching ERR: API non disponibile (G1_LOCAL_TEACHING=1 in .env + restart server)', 'err');
+            return;
+          }
+          log('Teaching ERR: ' + (d.error || d.detail || d.message || JSON.stringify(d)), 'err');
+          return;
+        }
         if (d.ok) log('Teaching OK: ' + action, 'ok');
         else log('Teaching ERR: ' + (d.error || JSON.stringify(d)), 'err');
       })
@@ -8865,13 +9063,16 @@ def run(host: str = "0.0.0.0", port: int = 8081, skip_audio_check: bool = False,
     # Verifica PortAudio all'avvio
     if not skip_audio_check:
         try:
-            from talk_module.audio import list_audio_devices
-            devs = list_audio_devices()
-            print(f"PortAudio OK - {len([d for d in devs if d.get('input_channels')])} mic, {len([d for d in devs if d.get('output_channels')])} speaker")
+            from talk_module.audio.recorder_factory import create_microphone_recorder
+
+            if create_microphone_recorder(device_id=0):
+                print("Audio input: PulseAudio/arecord (senza PortAudio) — come Grok Voice")
+            else:
+                raise OSError("no audio backend")
         except OSError as e:
-            if "PortAudio" in str(e):
-                print("ATTENZIONE: PortAudio non trovato. Solo modalità rete disponibile.")
-                print("Su Jetson Orin NX esegui: sudo bash scripts/install_audio_jetson.sh")
+            if "PortAudio" in str(e) or "no audio backend" in str(e):
+                print("ATTENZIONE: microfono locale non disponibile. Solo modalità rete (browser mic).")
+                print("Su Jetson: verifica USB mic + PulseAudio, oppure: sudo bash scripts/install_audio_jetson.sh")
                 print("Per ora: usa --no-audio-check per avviare comunque (dispositivi di rete).")
     try:
         from talk_module.audio.device_utils import probe_system_audio_hardware

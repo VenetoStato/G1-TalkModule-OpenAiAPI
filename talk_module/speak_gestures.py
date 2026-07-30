@@ -119,9 +119,9 @@ def dispatch_soundboard_slot_robot(
             ok, msg = execute_robot_action(arm)
             print(f"[{tag}] arm={arm!r} ok={ok} msg={msg}", flush=True)
         if teach_name:
-            from talk_module.explore_teaching import play_explore_teaching
+            from talk_module.teaching_catalog import play_teaching
 
-            result = play_explore_teaching(teach_name)
+            result = play_teaching(teach_name)
             print(
                 f"[{tag}] teach={teach_name!r} ok={result.get('ok')} msg={result.get('message')}",
                 flush=True,
@@ -406,9 +406,9 @@ def start_parla_teaching_gesture() -> bool:
     name = _pick_parla_teaching_gesture()
     if not name:
         return False
-    from talk_module.explore_teaching import play_explore_teaching_async
+    from talk_module.teaching_catalog import play_teaching_async
 
-    play_explore_teaching_async(name)
+    play_teaching_async(name)
     print(f"[talk-gesture] parla teaching {name!r}", flush=True)
     return True
 

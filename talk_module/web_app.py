@@ -4374,6 +4374,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     let wsListenServer = null, wakeServerMode = false;
     let wakeCommandMode = false, wakeCommandIdleTimer = null;
     let wakeAudioInFlight = false, wakeQueuedBlob = null;
+    let lastWakeGoodAnswerAt = 0;
     let listenServerWakeLatched = false;
     let wakeLevelCtx = null, wakeAnalyser = null, wakeInputGainNode = null, wakeLevelSampleInterval = null;
     let wakeSlicePeak = 0;
@@ -4562,7 +4563,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         var m = document.getElementById('parlaPreviewDisabledMsg');
         if (m) {
           m.style.display = 'block';
-          m.textContent = (err && err.message) ? err.message : 'Microfono non disponibile: consenti l\\'accesso (Dispositivi) e riprova.';
+          m.textContent = (err && err.message) ? err.message : "Microfono non disponibile: abilita l'accesso nelle impostazioni del browser per questo sito.";
         }
       });
     }
@@ -5133,10 +5134,23 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     var WAKE_POST_TTS_PAUSE_MS = 350;
     var _wakeDropSlicesAfterTts = 0;
+    function wakeRememberAnswer(){
+      lastWakeGoodAnswerAt = Date.now();
+    }
+    function wakeShouldKeepAnswerOnError(){
+      var wt = document.getElementById('wakeListenToggle');
+      return !!(wt && wt.checked && lastWakeGoodAnswerAt && (Date.now() - lastWakeGoodAnswerAt < 60000) && !wakeCommandMode);
+    }
+    function wakeSkipSliceNow(){
+      if (ttsPlaybackBusy) return true;
+      if (_wakeDropSlicesAfterTts > 0) { _wakeDropSlicesAfterTts--; return true; }
+      return false;
+    }
     function setRobotLed(state){
       try { fetch('/api/led', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({state:state})}); } catch(e){}
     }
     function onWakeResponseDone(){
+      _wakeDropSlicesAfterTts = 3;
       setTimeout(function(){
         resumeWakeListenAfterResponse();
       }, WAKE_POST_TTS_PAUSE_MS);
@@ -5163,9 +5177,16 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     function trySendWakeChunk(blob, skipWakeForBlob){
       if (!blob || blob.size < WS_AUDIO_MIN_BYTES) { scheduleNextWakeSliceIfListening(); return; }
+      if (wakeSkipSliceNow()) { scheduleNextWakeSliceIfListening(); return; }
       if (!document.getElementById('wakeListenToggle').checked) return;
       if (isRecording) { scheduleNextWakeSliceIfListening(); return; }
-      if (!ws || ws.readyState !== WebSocket.OPEN) { scheduleNextWakeSliceIfListening(); return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        wakeLog('WebSocket non pronto — in attesa connessione…', '#f59e0b');
+        var wst = document.getElementById('wakeListenStatus');
+        if (wst) wst.textContent = 'Connessione server…';
+        scheduleNextWakeSliceIfListening();
+        return;
+      }
       var sk = (typeof skipWakeForBlob === 'boolean') ? skipWakeForBlob : !!wakeCommandMode;
       if (wakeAudioInFlight) {
         wakeQueuedBlob = { blob: blob, skipWake: sk };
@@ -5462,10 +5483,31 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     }
     const wakeListenToggleEl = document.getElementById('wakeListenToggle');
     if (wakeListenToggleEl) {
-      wakeListenToggleEl.onchange = function(){
+      wakeListenToggleEl.onchange = async function(){
         if (wakeListenToggleEl.checked) {
           window.g1SetTalkAgentMode('legacy');
           const st = document.getElementById('wakeListenStatus');
+          const micVal = document.getElementById('mic') ? document.getElementById('mic').value : '';
+          const isLocalMic = micVal && String(micVal).indexOf('local_') === 0;
+          const isBrowserMic = micVal && String(micVal).indexOf('webmic_') === 0;
+          if (!isLocalMic && !isBrowserMic) {
+            if (st) st.textContent = 'Seleziona un microfono Browser in Audio Talk (es. RealSense / DJI).';
+            wakeListenToggleEl.checked = false;
+            var wtl0 = document.getElementById('wakeToggleLabel');
+            if (wtl0) wtl0.textContent = 'OFF';
+            if (typeof requestAndLoadDevices === 'function') requestAndLoadDevices();
+            return;
+          }
+          if (st) st.textContent = 'Connessione server…';
+          try {
+            await ensureWakeWs();
+          } catch(e) {
+            if (st) st.textContent = 'WebSocket non connesso — ricarica la pagina (Ctrl+Shift+R).';
+            wakeListenToggleEl.checked = false;
+            var wtl1 = document.getElementById('wakeToggleLabel');
+            if (wtl1) wtl1.textContent = 'OFF';
+            return;
+          }
           if (st) st.textContent = 'Avvio ascolto…';
           startWakeRecorder();
         } else {
@@ -5567,6 +5609,8 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
               if (r.response && String(r.response).trim()) {
                 wakeLog('WAKE: ' + String(r.response), '#22c55e');
                 document.getElementById('result').innerHTML = '<div><b>Hai detto:</b> '+(r.text||'')+'</div><div><b>Risposta:</b> '+(r.response||'')+'</div>';
+                wakeRememberAnswer();
+                _wakeDropSlicesAfterTts = 3;
                 var ackHasTts = lastPlayOn === 'browser' && r.audio_base64 && String(r.audio_base64).length > 50;
                 if (ackHasTts) {
                   enqueueTtsPlayback(r.audio_base64, function(){
@@ -5588,7 +5632,9 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
               wakeLog('msg: '+r.message, '#f59e0b');
               const wst = document.getElementById('wakeListenStatus');
               if (wst) wst.textContent = wakeCommandMode ? 'Ti ascolto\u2026' : 'In ascolto per \u00abHey G1\u00bb\u2026';
-              document.getElementById('result').innerHTML = '<div class="warn">'+r.message+'</div>';
+              if (!wakeShouldKeepAnswerOnError()) {
+                document.getElementById('result').innerHTML = '<div class="warn">'+r.message+'</div>';
+              }
               if (btn) btn.disabled = false;
               resumeWakeListen = true;
               return;
@@ -5602,6 +5648,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
           const msg = r.message ? '<div class="warn">'+r.message+'</div>' : '';
           const dur = r.duration_ms ? ' <span style="color:#71717a;font-size:12px;">('+r.duration_ms+' ms)</span>' : '';
           document.getElementById('result').innerHTML = msg + '<div><b>Hai detto:</b> '+(r.text||'')+'</div><div><b>Risposta:</b> '+(r.response||'')+dur+'</div>';
+          if (r.response && String(r.response).trim()) {
+            wakeRememberAnswer();
+            _wakeDropSlicesAfterTts = 3;
+          }
           const hasTts = lastPlayOn === 'browser' && r.audio_base64 && String(r.audio_base64).length > 50;
           const hasServerTts = lastPlayOn === 'server' && r.response && String(r.response).trim().length > 0;
           if (r.response && String(r.response).trim()) {
@@ -5641,11 +5691,50 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
     function connect(){
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
-        document.getElementById('result').innerHTML = '<div class="ok">Connesso al server. Tieni premuto e parla.</div>';
-        document.getElementById('recDebug').textContent = 'WebSocket OK';
+        var res = document.getElementById('result');
+        if (res && !res.innerHTML) {
+          res.innerHTML = '<div class="ok">Connesso al server. Attiva Talk classico o scrivi una domanda.</div>';
+        }
+        var dbg = document.getElementById('recDebug');
+        if (dbg) dbg.textContent = 'WebSocket OK';
+        var wst = document.getElementById('wakeListenStatus');
+        var wt = document.getElementById('wakeListenToggle');
+        if (wst && wt && wt.checked && wst.textContent.indexOf('Connessione') >= 0) {
+          wst.textContent = 'In ascolto per \u00abHey G1\u00bb\u2026';
+        }
       };
-      ws.onclose = () => { setTimeout(connect, 3000); document.getElementById('result').innerHTML = '<div class="warn">Riconnessione...</div>'; document.getElementById('recDebug').textContent = 'WebSocket disconnesso'; };
+      ws.onclose = () => {
+        setTimeout(connect, 3000);
+        var res = document.getElementById('result');
+        if (res) res.innerHTML = '<div class="warn">Riconnessione WebSocket…</div>';
+        var dbg = document.getElementById('recDebug');
+        if (dbg) dbg.textContent = 'WebSocket disconnesso';
+      };
       ws.onmessage = onWsPipelineMessage;
+    }
+    function ensureWakeWs(){
+      return new Promise(function(resolve, reject){
+        if (ws && ws.readyState === WebSocket.OPEN) return resolve();
+        if (ws && ws.readyState === WebSocket.CONNECTING) {
+          var t0 = Date.now();
+          var iv = setInterval(function(){
+            if (ws && ws.readyState === WebSocket.OPEN) { clearInterval(iv); resolve(); }
+            else if (!ws || ws.readyState === WebSocket.CLOSED || Date.now() - t0 > 12000) {
+              clearInterval(iv);
+              reject(new Error('WebSocket non connesso'));
+            }
+          }, 120);
+          return;
+        }
+        try {
+          ws = new WebSocket(wsUrl);
+          ws.onmessage = onWsPipelineMessage;
+          ws.onclose = function(){ setTimeout(connect, 3000); };
+          var to = setTimeout(function(){ reject(new Error('timeout WebSocket')); }, 12000);
+          ws.onopen = function(){ clearTimeout(to); resolve(); };
+          ws.onerror = function(){ clearTimeout(to); reject(new Error('WebSocket errore')); };
+        } catch(err) { reject(err); }
+      });
     }
     function ensureParlaWs(){
       return new Promise(function(resolve, reject){
@@ -5933,10 +6022,14 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         if (cfg.speaker && cfg.speaker.value) {
           try { spkSel.value = cfg.speaker.value; } catch(_){}
         }
-        if (!restoredMic && (!cfg.microphone || !cfg.microphone.value || cfg.microphone.value === 'web_wait')) {
+        var curMic = micSel.value || '';
+        if (mics.length > 0 && (curMic.indexOf('local_') === 0 || curMic.indexOf('net_') === 0 || !curMic || curMic === 'web_wait')) {
+          preferBrowserMicOnClient();
+        } else if (!restoredMic && (!cfg.microphone || !cfg.microphone.value || cfg.microphone.value === 'web_wait')) {
           preferBrowserMicOnClient();
         }
         applyLocalMicDefaultsIfUnset(micSel.value);
+        autoSaveMicConfigFromUi();
         var vsp = spkSel.value;
         lastSinkId = (vsp && vsp.indexOf('browser_') === 0 && vsp !== 'browser_default') ? vsp.replace(/^browser_/, '') : null;
         syncSbOutputFromSpeaker();
@@ -7401,14 +7494,66 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       }
       function _camStreamUrl(){ return location.origin + '/api/camera/stream?_=' + Date.now(); }
       function _camResetIdleUI(){
-        _camSetStatus(_camEl('clientCamStatus'), 'Visione disattivata', null);
+        if (_camVisionActive()) {
+          _camSetPendingUI();
+          return;
+        }
+        _camSetStatus(_camEl('clientCamStatus'), 'Visione disattivata — spunta Attiva visione sopra', null);
         _camSetStatus(_camEl('clientCamYolo'), '--', null);
         var fps = _camEl('clientCamFps'); if (fps) fps.textContent = '--';
-        var be = _camEl('clientCamBackend'); if (be) be.textContent = '--';
+        var be = _camEl('clientCamBackend'); if (be) be.textContent = '…';
         var detEl = _camEl('clientCamDets');
         if (detEl) detEl.textContent = '—';
         var pickEl = _camEl('clientPickStatus');
         if (pickEl) pickEl.textContent = 'Auto-pick: — (attiva visione)';
+        _camPollIdleConfig();
+      }
+      function _camSetPendingUI(){
+        _camSetStatus(_camEl('clientCamStatus'), 'Avvio stream…', null);
+        var ph = _camEl('clientCamPlaceholder');
+        if (ph) {
+          ph.style.display = 'flex';
+          ph.textContent = 'Connessione camera in corso…';
+        }
+        var img = _camEl('clientCamStream');
+        if (img) { img.style.display = 'none'; img.removeAttribute('src'); }
+        _camStreaming = false;
+      }
+      async function _camFetchPost(url, timeoutMs){
+        if (!timeoutMs) {
+          return fetch(url, { method: 'POST', credentials: 'same-origin' });
+        }
+        var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var timer = ctrl ? setTimeout(function(){ try { ctrl.abort(); } catch (_) {} }, timeoutMs) : null;
+        try {
+          return await fetch(url, {
+            method: 'POST',
+            credentials: 'same-origin',
+            signal: ctrl ? ctrl.signal : undefined,
+          });
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+      async function _camPollIdleConfig(){
+        if (_camVisionActive() || _camSessionActive) return;
+        try {
+          var r = await fetch(location.origin + '/api/camera/status', { credentials: 'same-origin' });
+          var s = await r.json();
+          var be = _camEl('clientCamBackend');
+          if (be) {
+            var beTxt = s.source || 'v4l';
+            if (s.device != null) beTxt += ' · dev ' + s.device;
+            if (s.config_source) beTxt += ' (' + s.config_source + ')';
+            be.textContent = beTxt;
+          }
+          if (s.open_error) {
+            _camSetStatus(_camEl('clientCamStatus'), 'Errore camera: ' + String(s.open_error).slice(0, 56), false);
+          }
+        } catch (_) {
+          var be2 = _camEl('clientCamBackend');
+          if (be2) be2.textContent = 'API non raggiungibile';
+        }
       }
       function _camUpdateControls(enabled){
         ['clientCamBtnStart','clientCamBtnStop','clientCamBtnRefresh','clientPickOnBtn','clientPickOffBtn'].forEach(function(id){
@@ -7423,15 +7568,20 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
           if (!_camVisionActive()) return;
           img.onerror = function(){
             _camSetStatus(_camEl('clientCamStatus'), 'Stream non disponibile (camera Jetson?)', false);
-            if (ph) { ph.style.display = 'flex'; ph.textContent = 'Stream non disponibile — controlla RealSense / G1_CAMERA_DEVICE'; }
+            if (ph) { ph.style.display = 'flex'; ph.textContent = 'Stream non disponibile — apri Log Jetson o esegui: ls /dev/video*'; }
             img.style.display = 'none';
             _camStreaming = false;
           };
           img.onload = function(){ if (ph) ph.style.display = 'none'; };
           img.style.display = 'block';
           img.src = _camStreamUrl();
-          if (ph) ph.style.display = 'none';
           _camStreaming = true;
+          setTimeout(function(){
+            if (ph && _camStreaming && img.style.display === 'block' && (!img.complete || !img.naturalWidth)) {
+              ph.style.display = 'flex';
+              ph.textContent = 'In attesa del primo frame… (probe camera sul Jetson)';
+            }
+          }, 4000);
         } else {
           img.onerror = null;
           img.onload = null;
@@ -7458,7 +7608,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
             _camSetStatus(_camEl('clientCamYolo'), 'Disabilitato', null);
           }
           _camEl('clientCamFps').textContent = s.fps ? String(s.fps) : '--';
-          _camEl('clientCamBackend').textContent = s.backend || (s.source || '--');
+          var beTxt = s.backend || s.source || '--';
+          if (s.device != null) beTxt += ' · dev ' + s.device;
+          if (s.config_source) beTxt += ' (' + s.config_source + ')';
+          _camEl('clientCamBackend').textContent = beTxt;
           var dets = s.detections || [];
           var detEl = _camEl('clientCamDets');
           if (detEl) {
@@ -7491,7 +7644,7 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         _camStopPoll();
         _camShow(false);
         if (hadSession) {
-          try { await fetch(location.origin + '/api/camera/stop', { method: 'POST', credentials: 'same-origin' }); } catch (_) {}
+          try { await _camFetchPost(location.origin + '/api/camera/stop', 6000); } catch (_) {}
           try {
             await fetch(location.origin + '/api/pick/enable', {
               method: 'POST',
@@ -7501,12 +7654,14 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
             });
           } catch (_) {}
         }
-        _camResetIdleUI();
+        if (!_camVisionActive()) _camResetIdleUI();
+        else _camSetPendingUI();
       }
       async function _camOnVisionToggle(){
         if (_camVisionActive()) {
           _camUpdateControls(true);
-          await window.g1ClientCameraStart();
+          _camSetPendingUI();
+          setTimeout(function(){ window.g1ClientCameraStart(); }, 0);
         } else {
           _camUpdateControls(false);
           await _camTeardownSession();
@@ -7553,19 +7708,47 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       window.g1ClientCameraStart = async function(){
         if (!_camVisionActive()) return;
         _camUpdateControls(true);
+        _camSetPendingUI();
         try {
-          var r = await fetch(location.origin + '/api/camera/start', { method: 'POST', credentials: 'same-origin' });
+          var r = await _camFetchPost(location.origin + '/api/camera/start');
           var d = await r.json().catch(function(){ return {}; });
           if (!r.ok) {
             var msg = (d && (d.message || d.detail || d.open_error)) ? String(d.message || d.detail || d.open_error) : ('HTTP '+r.status);
             _camSetStatus(_camEl('clientCamStatus'), msg.slice(0, 80), false);
+            var phErr = _camEl('clientCamPlaceholder');
+            if (phErr) { phErr.style.display = 'flex'; phErr.textContent = msg.slice(0, 120); }
             return;
           }
+          if (!_camVisionActive()) return;
           _camSessionActive = true;
-          _camShow(true);
           _camStartPoll();
+          var deadline = Date.now() + 45000;
+          while (Date.now() < deadline && _camVisionActive() && _camSessionActive) {
+            var sr = await fetch(location.origin + '/api/camera/status', { credentials: 'same-origin' });
+            var st = await sr.json().catch(function(){ return {}; });
+            if (st.open_error) {
+              _camSetStatus(_camEl('clientCamStatus'), String(st.open_error).slice(0, 80), false);
+              var phE = _camEl('clientCamPlaceholder');
+              if (phE) { phE.style.display = 'flex'; phE.textContent = String(st.open_error).slice(0, 140); }
+              _camSessionActive = false;
+              return;
+            }
+            if (st.has_frame) {
+              _camShow(true);
+              _camPollStatus();
+              return;
+            }
+            _camSetStatus(_camEl('clientCamStatus'), st.running ? 'Cerco camera USB…' : 'Avvio…', null);
+            await new Promise(function(res){ setTimeout(res, 1200); });
+          }
+          _camShow(true);
+          _camPollStatus();
         } catch (e) {
-          _camSetStatus(_camEl('clientCamStatus'), String(e.message || e), false);
+          var errMsg = String(e && (e.message || e.name) ? (e.message || e.name) : e);
+          if (/aborted|abort/i.test(errMsg)) errMsg = 'Timeout connessione al Jetson — riprova Avvia stream';
+          _camSetStatus(_camEl('clientCamStatus'), errMsg.slice(0, 80), false);
+          var phFail = _camEl('clientCamPlaceholder');
+          if (phFail) { phFail.style.display = 'flex'; phFail.textContent = 'Errore avvio camera: ' + errMsg.slice(0, 100); }
         }
       };
       window.g1ClientCameraStop = async function(){
@@ -7582,18 +7765,20 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
         _camPollStatus();
       };
       window.g1ClientCameraOnShow = function(){
-        if (_camVisionActive() && !_camSessionActive) {
+        if (_camVisionActive()) {
           _camUpdateControls(true);
-          window.g1ClientCameraStart();
-        } else {
-          _camUpdateControls(_camVisionActive());
-          if (!_camVisionActive()) {
-            _camShow(false);
-            _camResetIdleUI();
+          if (!_camSessionActive) {
+            _camSetPendingUI();
+            setTimeout(function(){ window.g1ClientCameraStart(); }, 0);
           }
+        } else {
+          _camUpdateControls(false);
+          _camShow(false);
+          _camResetIdleUI();
         }
       };
       window.g1ClientCameraOnHide = async function(){
+        if (!_camVisionActive() && !_camSessionActive) return;
         _camVisionCheckbox(false);
         _camUpdateControls(false);
         await _camTeardownSession();
@@ -7605,7 +7790,10 @@ CLIENT_TEMPLATE = """<!DOCTYPE html>
       var _camBtnRefresh = _camEl('clientCamBtnRefresh');
       var _camVisionCb = _camEl('clientCamVisionEnable');
       if (_camVisionCb) _camVisionCb.onchange = function(){ _camOnVisionToggle(); };
-      if (_camBtnStart) _camBtnStart.onclick = function(){ if (!_camVisionActive()) _camVisionCheckbox(true); window.g1ClientCameraStart(); };
+      if (_camBtnStart) _camBtnStart.onclick = function(){
+        if (!_camVisionActive()) _camVisionCheckbox(true);
+        window.g1ClientCameraStart();
+      };
       if (_camBtnStop) _camBtnStop.onclick = function(){ window.g1ClientCameraStop(); };
       if (_camBtnRefresh) _camBtnRefresh.onclick = function(){ window.g1ClientCameraRefresh(); };
     })();

@@ -107,6 +107,9 @@ scp @sshCommon `
     "$root\talk_module\vr_teleop.py" `
     "$root\talk_module\vr_teleop_api.py" `
     "$root\talk_module\camera_api.py" `
+    "$root\talk_module\camera_config.py" `
+    "$root\talk_module\v4l_probe.py" `
+    "$root\talk_module\teleimager_zmq.py" `
     "$root\talk_module\camera_yolo.py" `
     "$root\talk_module\yolo_onnx.py" `
     "$root\talk_module\pick_on_detect.py" `
@@ -129,6 +132,7 @@ scp @sshCommon `
 if ($LASTEXITCODE -ne 0) { Write-Host ""; Write-Host " ERRORE scp [1c] codice $LASTEXITCODE" -ForegroundColor Red; exit $LASTEXITCODE }
 scp @sshCommon `
     "$root\talk_module\audio\g1_speaker.py" `
+    "$root\talk_module\audio\mic_gain.py" `
     "$root\talk_module\audio\soundboard_convert.py" `
     "$root\talk_module\audio\soundboard_pcm_cache.py" `
     "${sshHost}:${remote}/talk_module/audio/"
@@ -148,6 +152,7 @@ scp @sshCommon `
     "$root\config\elenco_testi_soundboard.txt" `
     "$root\config\pick_maneuver.json" `
     "$root\config\hand_grasp.json" `
+    "$root\config\camera.json" `
     "${sshHost}:${remote}/config/"
 if ($LASTEXITCODE -ne 0) { Write-Host ""; Write-Host " ERRORE scp [2] codice $LASTEXITCODE" -ForegroundColor Red; exit $LASTEXITCODE }
 Write-Host " OK" -ForegroundColor Green

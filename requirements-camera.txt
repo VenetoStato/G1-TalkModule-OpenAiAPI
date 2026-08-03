@@ -1,3 +1,7 @@
 # Camera + YOLO ONNX sulla dashboard (/dashboard)
 # Sul Jetson — NON installare ultralytics (scarica PyTorch/CUDA ~500MB).
 opencv-python-headless>=4.8.0
+pyzmq>=25.0.0
+
+# G1-D teleimager: NON serve pip install teleimager (Python<3.11).
+# Il talk module usa talk_module/teleimager_zmq.py (solo pyzmq).

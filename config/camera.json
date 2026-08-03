@@ -1,0 +1,12 @@
+{
+  "source": "teleimager",
+  "device": "127.0.0.1",
+  "teleimager_port": 60000,
+  "teleimager_camera": "head",
+  "width": 640,
+  "height": 480,
+  "fps": 15,
+  "yolo": true,
+  "depth": false,
+  "comment": "G1-D: teleimager-server già attivo sul Jetson (ZMQ head_camera)"
+}

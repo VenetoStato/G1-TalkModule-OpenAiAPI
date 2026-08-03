@@ -8,7 +8,8 @@ import time
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from talk_module.camera_yolo import get_camera_service
+from talk_module.camera_yolo import get_camera_service, reset_camera_service
+from talk_module.v4l_probe import v4l_capture_indices
 
 router = APIRouter(prefix="/api/camera", tags=["camera"])
 
@@ -33,6 +34,22 @@ def camera_stop():
     return {"ok": True, **svc.status()}
 
 
+@router.post("/reload")
+def camera_reload():
+    """Rilegge config/camera.json al prossimo avvio (non blocca su probe V4L2)."""
+    reset_camera_service()
+    return {"ok": True, "reloaded": True}
+
+
+@router.get("/devices")
+def camera_devices():
+    """Elenco probe V4L2 (debug: quale /dev/video* funziona)."""
+    from talk_module.v4l_probe import probe_v4l_devices
+
+    found, report = probe_v4l_devices()
+    return {"ok": True, "selected": found, "devices": report, "capture_indices": v4l_capture_indices()}
+
+
 @router.get("/snapshot")
 def camera_snapshot():
     svc = get_camera_service()
@@ -47,7 +64,10 @@ def camera_snapshot():
     if not jpeg:
         return JSONResponse(
             status_code=503,
-            content={"ok": False, "message": "Nessun frame camera. Verifica G1_CAMERA_DEVICE o RealSense."},
+            content={
+                "ok": False,
+                "message": "Nessun frame camera. Verifica config/camera.json o G1_CAMERA_DEVICE (/dev/video*).",
+            },
         )
     return Response(content=jpeg, media_type="image/jpeg")
 

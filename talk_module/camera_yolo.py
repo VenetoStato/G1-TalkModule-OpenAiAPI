@@ -9,47 +9,49 @@ from typing import Any, Optional
 
 import numpy as np
 
+from talk_module.camera_config import load_camera_settings
+from talk_module.v4l_probe import probe_v4l_devices, try_open_v4l, v4l_capture_indices
+
 _lock = threading.Lock()
 _service: Optional["CameraYoloService"] = None
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int((os.getenv(name) or str(default)).strip())
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float((os.getenv(name) or str(default)).strip())
-    except ValueError:
-        return default
+def _probe_v4l_device(preferred: str, *, width: int = 640, height: int = 480, fps: int = 15) -> str:
+    preferred = (preferred or "auto").strip()
+    found, report = probe_v4l_devices(width=width, height=height, fps=fps, preferred=preferred)
+    if found:
+        print(f"[camera] V4L2 auto-rilevata: /dev/video{found}", flush=True)
+        return found
+    tried = ", ".join(f"/dev/video{r['device']}" for r in report[:6]) or "(nessuno)"
+    print(f"[camera] probe V4L2 fallito, provati: {tried}", flush=True)
+    return "auto"
 
 
 class CameraYoloService:
     def __init__(self) -> None:
-        self.source = (os.getenv("G1_CAMERA_SOURCE") or "v4l").strip().lower()
-        self.device = (os.getenv("G1_CAMERA_DEVICE") or "0").strip()
-        self.model_name = (os.getenv("G1_YOLO_MODEL") or "yolov8n.onnx").strip()
-        self.yolo_backend = (os.getenv("G1_YOLO_BACKEND") or "onnx").strip().lower()
-        self.width = _env_int("G1_CAMERA_WIDTH", 640)
-        self.height = _env_int("G1_CAMERA_HEIGHT", 480)
-        self.fps = _env_int("G1_CAMERA_FPS", 15)
-        self.conf = _env_float("G1_YOLO_CONF", 0.35)
-        self.yolo_enabled = (os.getenv("G1_CAMERA_YOLO", "1") or "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-        self.depth_enabled = (os.getenv("G1_CAMERA_DEPTH", "1") or "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-        raw_classes = (os.getenv("G1_YOLO_CLASSES") or "").strip()
+        settings = load_camera_settings()
+        self.source = settings["source"]
+        self.device = settings["device"]
+        self.model_name = settings["yolo_model"]
+        self.yolo_backend = settings["yolo_backend"]
+        self.width = settings["width"]
+        self.height = settings["height"]
+        self.fps = settings["fps"]
+        self.conf = settings["yolo_conf"]
+        self.yolo_enabled = settings["yolo"]
+        self.depth_enabled = settings["depth"]
+        self.config_source = settings.get("config_source") or "env"
+        self.config_path = settings.get("config_path")
+        self.teleimager_host = settings.get("teleimager_host") or "127.0.0.1"
+        self.teleimager_port = int(settings.get("teleimager_port") or 60000)
+        self.teleimager_camera = settings.get("teleimager_camera") or "head"
+        raw_classes = settings.get("yolo_classes") or ""
         self.yolo_classes: Optional[set[str]] = (
-            {c.strip().lower() for c in raw_classes.split(",") if c.strip()} if raw_classes else None
+            {c.strip().lower() for c in str(raw_classes).split(",") if c.strip()} if raw_classes else None
+        )
+        print(
+            f"[camera] config source={self.config_source} camera={self.source} device={self.device!r}",
+            flush=True,
         )
 
         self._running = False
@@ -61,6 +63,8 @@ class CameraYoloService:
         self._yolo_backend_loaded = ""
         self._yolo_error: Optional[str] = None
         self._open_error: Optional[str] = None
+        self._probe_report: list[dict[str, Any]] = []
+        self._teleimager_getter: Any = None
         self._latest_jpeg: Optional[bytes] = None
         self._latest_ts = 0.0
         self._frame_count = 0
@@ -88,6 +92,9 @@ class CameraYoloService:
                 "resolution": f"{self.width}x{self.height}",
                 "detections": list(self._detections),
                 "has_frame": self._latest_jpeg is not None,
+                "config_source": self.config_source,
+                "config_path": self.config_path,
+                "probe_report": list(self._probe_report[:8]),
             }
 
     def start(self) -> None:
@@ -119,36 +126,103 @@ class CameraYoloService:
         if not backend:
             return
         try:
-            if kind == "v4l":
+            if kind == "v4l" or (kind and str(kind).startswith("v4l")):
                 backend.release()
             elif kind == "realsense":
                 backend.stop()
+            elif kind == "teleimager":
+                if hasattr(backend, "close"):
+                    backend.close()
         except Exception:
             pass
 
-    def _open_v4l(self) -> bool:
+    def _try_open_teleimager(self) -> bool:
+        host = self.teleimager_host
+        port = self.teleimager_port
+        cam = self.teleimager_camera
+        client: Any = None
         try:
-            import cv2  # type: ignore
+            from talk_module.teleimager_zmq import TeleimagerZmqClient
 
-            dev: Any = self.device
-            if dev.isdigit():
-                dev = int(dev)
-            cap = cv2.VideoCapture(dev)
-            if not cap.isOpened():
-                cap.release()
-                self._open_error = f"V4L2: impossibile aprire {self.device!r} (prova ls /dev/video*)"
-                return False
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            cap.set(cv2.CAP_PROP_FPS, self.fps)
-            self._backend = cap
-            self._backend_kind = "v4l"
-            print(f"[camera] V4L2 device={self.device!r}", flush=True)
+            client = TeleimagerZmqClient(host=host, request_port=port, camera=cam)
+            client.connect(wait_frame_s=8.0)
+            self._backend = client
+            self._teleimager_getter = client.get_bgr
+            self._backend_kind = "teleimager"
+            self._open_error = None
+            self.device = f"teleimager@{host}:{cam}"
+            print(f"[camera] teleimager ZMQ {cam} da {host}:{port}", flush=True)
             return True
-        except Exception as e:
-            self._open_error = f"OpenCV: {e}"
+        except Exception as err:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            # Fallback pacchetto teleimager (Python <3.11)
+            try:
+                from teleimager.image_client import ImageClient  # type: ignore
+
+                client = ImageClient(host=host, request_port=port, request_bgr=True)
+                getter = {
+                    "head": client.get_head_frame,
+                    "left_wrist": client.get_left_wrist_frame,
+                    "right_wrist": client.get_right_wrist_frame,
+                }.get(cam, client.get_head_frame)
+                frame = None
+                for _ in range(40):
+                    frame = getter()
+                    if frame is not None and getattr(frame, "bgr", None) is not None:
+                        break
+                    time.sleep(0.15)
+                if frame is None or frame.bgr is None:
+                    client.close()
+                    raise RuntimeError("nessun frame dal pacchetto teleimager")
+                self._backend = client
+                self._teleimager_getter = lambda: getter().bgr if getter() else None
+                self._backend_kind = "teleimager"
+                self._open_error = None
+                self.device = f"teleimager@{host}:{cam}"
+                return True
+            except ImportError:
+                pass
+            except Exception as pkg_err:
+                err = pkg_err
+            self._open_error = f"teleimager {host}:{port} ({cam}): {err}"
             print(f"[camera] {self._open_error}", flush=True)
             return False
+
+    def _open_v4l(self) -> bool:
+        preferred = str(self.device).strip() or "auto"
+        found, report = probe_v4l_devices(
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            preferred=preferred,
+        )
+        if not found:
+            self._probe_report = report
+            if self._try_open_teleimager():
+                return True
+            tried = ", ".join(f"/dev/video{r['device']}" for r in report[:8]) or "nessuno"
+            self._open_error = f"V4L2: nessuna camera ({tried}). Configura source=teleimager in camera.json"
+            return False
+
+        self._probe_report = report
+        cap, err, mode = try_open_v4l(found, width=self.width, height=self.height, fps=self.fps)
+        if cap is None:
+            self._open_error = f"V4L2: {err}"
+            print(f"[camera] {self._open_error}", flush=True)
+            if not self._try_open_teleimager():
+                return False
+            return True
+
+        self.device = found
+        self._backend = cap
+        self._backend_kind = "v4l" + (f"-{mode}" if mode else "")
+        self._open_error = None
+        print(f"[camera] V4L2 device=/dev/video{self.device}", flush=True)
+        return True
 
     def _open_realsense(self) -> bool:
         try:
@@ -181,10 +255,14 @@ class CameraYoloService:
     def _open_backend(self) -> bool:
         self._close_backend()
         self._open_error = None
+        if self.source == "teleimager":
+            return self._try_open_teleimager()
         if self.source == "realsense":
             if self._open_realsense():
                 return True
-            print("[camera] RealSense fallita → provo V4L2 (webcam /dev/video0)", flush=True)
+            print("[camera] RealSense fallita → fallback V4L2", flush=True)
+            if str(self.device).strip().lower() == "auto":
+                self.device = _probe_v4l_device("auto", width=self.width, height=self.height, fps=self.fps)
         return self._open_v4l()
 
     def _read_frame_bgr(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -203,6 +281,19 @@ class CameraYoloService:
                     if depth:
                         depth_mm = np.asanyarray(depth.get_data())
                 return bgr, depth_mm
+            except Exception:
+                return None, None
+        if self._backend_kind == "teleimager":
+            try:
+                if hasattr(self._backend, "get_bgr"):
+                    bgr = self._backend.get_bgr()
+                else:
+                    getter = self._teleimager_getter or self._backend.get_head_frame
+                    frame = getter()
+                    bgr = frame.bgr if frame is not None else None
+                if bgr is None:
+                    return None, None
+                return bgr.copy() if hasattr(bgr, "copy") else bgr, None
             except Exception:
                 return None, None
         try:
@@ -391,6 +482,14 @@ class CameraYoloService:
             time.sleep(sleep_s)
 
         self._close_backend()
+
+
+def reset_camera_service() -> None:
+    global _service
+    with _lock:
+        if _service is not None:
+            _service.stop()
+        _service = None
 
 
 def get_camera_service() -> CameraYoloService:
